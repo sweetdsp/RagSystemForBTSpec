@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RAG Lab: the official spec is copyrighted and large; keep it out of git
+data/*.pdf
+!data/sample_bluetooth_primer.pdf

@@ -1,0 +1,47 @@
+# RAG Lab — exact, tested versions for Python 3.10–3.13 (environment markers pick the right
+# pin where the newest release dropped older Pythons). Verified on Linux with 3.10 and 3.13.
+#
+# Lighter CPU-only PyTorch (recommended, avoids a multi-GB CUDA download):
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+# then:
+#   pip install -r requirements.txt
+
+# --- Web UI -------------------------------------------------------------------
+streamlit==1.66.0 ; python_version >= "3.11"
+streamlit==1.65.0 ; python_version < "3.11"
+altair==6.3.0 ; python_version >= "3.11"
+altair==6.2.2 ; python_version < "3.11"
+pandas==3.0.6 ; python_version >= "3.11"
+pandas==2.3.3 ; python_version < "3.11"
+numpy==2.5.4 ; python_version >= "3.12"
+numpy==2.4.6 ; python_version == "3.11"
+numpy==2.2.6 ; python_version < "3.11"
+
+# --- Configuration ------------------------------------------------------------
+python-dotenv==1.2.4
+
+# --- PDF parsing --------------------------------------------------------------
+pypdf==6.21.1
+cryptography==50.0.2          # lets pypdf open AES-encrypted (copy-protected) PDFs
+
+# --- RAG orchestration (LangChain) ---------------------------------------------
+langchain-core==1.6.12
+langchain-text-splitters==1.1.3
+langchain-community==0.4.2    # FAISS vector-store wrapper
+langchain-chroma==1.1.0
+langchain-openai==1.7.2
+langchain-ollama==1.1.0
+langchain-huggingface==1.2.3
+tiktoken==0.14.0              # TokenTextSplitter + token counts
+
+# --- Vector databases ----------------------------------------------------------
+faiss-cpu==1.15.1
+chromadb==1.5.9
+
+# --- Local embeddings (HuggingFace all-MiniLM-L6-v2 etc.) -----------------------
+sentence-transformers==6.2.0
+torch==2.14.1
+
+# --- Dev / tooling -------------------------------------------------------------
+fpdf2==2.8.9                  # only for scripts/make_sample_pdf.py
+pytest==9.1.1
