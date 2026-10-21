@@ -33,7 +33,7 @@ def _env_int(name: str, default: int) -> int:
 # ---------------------------------------------------------------------------
 DATA_DIR = PROJECT_ROOT / "data"
 
-#: The full Bluetooth Core Specification (download it yourself, see data/README.md).
+#: The Bluetooth Core Specification (v5.4 is included in data/, see data/README.md).
 DEFAULT_PDF_PATH = Path(os.getenv("DEFAULT_PDF_PATH", DATA_DIR / "bluetooth_core_spec.pdf"))
 
 #: Small, bundled, self-written primer used when the real spec is not present.

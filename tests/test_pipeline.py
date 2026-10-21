@@ -8,10 +8,10 @@ import pytest
 from rag_lab import settings
 from rag_lab.benchmark import DEFAULT_PRESETS, run_queries_blocking
 from rag_lab.chunking import CHARACTER, RECURSIVE, TOKEN, split_document, token_counting_is_exact
-from rag_lab.embeddings import get_embeddings
+from rag_lab.embeddings import HashingEmbeddings, get_embeddings
 from rag_lab.errors import ChunkingError, MissingAPIKeyError, PDFLoadError
 from rag_lab.insights import analyze, token_f1
-from rag_lab.pdf_loader import PageText, load_pdf, read_pdf_bytes, strip_running_headers
+from rag_lab.pdf_loader import PageText, clean_text, load_pdf, outline_of, read_pdf_bytes, section_for_page, strip_running_headers
 from rag_lab.pipeline import RAGConfig, answer_question, build_index
 from rag_lab.settings import ModelSpec
 
@@ -150,3 +150,64 @@ def test_token_splitter_with_offline_byte_encoding(parsed, monkeypatch):
         assert all(c.metadata["start_index"] >= 0 for c in chunks)
     finally:
         chunking._load_encoding.cache_clear()
+
+
+def test_chapter_specific_headers_are_removed():
+    """Headers that change per chapter never reach a document-wide majority."""
+    pages = []
+    for chapter in ("Radio", "Baseband", "Link Layer"):
+        for i in range(8):
+            n = len(pages) + 1
+            pages.append(PageText(n, f"{chapter} Version Date: 2023-01-31\nVol 2, Part {chapter[0]} page {n}\n{chapter} spec\nBody {chapter} {'x' * i}"))
+    strip_running_headers(pages)
+    assert all(p.text.startswith("Body ") for p in pages), [p.text for p in pages if not p.text.startswith("Body")]
+
+
+def test_glyph_garbage_and_control_chars_are_cleaned():
+    text = "Real sentence about AFH.\n/^ͺ^ǇŶĐͺĞůĂǇĨŽƌŵŝĚĚůĞ/^\n(YHQW\x03[ x\nµs and ≤ 20 channels"
+    assert clean_text(text) == "Real sentence about AFH.\n(YHQW[ x\nµs and ≤ 20 channels"
+
+
+def test_hashing_embedding_never_returns_zero_vector():
+    emb = HashingEmbeddings()
+    for text in ["", "/^ͺ^", "the of and"]:
+        assert sum(v * v for v in emb.embed_query(text)) == pytest.approx(1.0)
+    a, b = emb.embed_documents(["LE power class 1.5 maximum output", "the what is of"])
+    q = emb.embed_query("What are the LE power classes?")
+    assert sum(x * y for x, y in zip(q, a)) > sum(x * y for x, y in zip(q, b))
+
+
+def test_outline_sections_from_bookmarks(tmp_path):
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_font("Helvetica", size=12)
+    layout = [(0, "Vol 1: Core"), (1, "Part A: Radio"), (1, "Part B: Baseband"), (0, "Vol 2: Host"), (1, "Part A: L2CAP")]
+    for level, title in layout:
+        for _ in range(2):
+            pdf.add_page()
+            pdf.cell(0, 10, f"{title} text")
+        pdf.start_section(title, level=level)  # bookmark points at the current (2nd) page
+    data = bytes(pdf.output())
+    outline = outline_of(data)
+    assert [(s.depth, s.title) for s in outline] == layout
+    assert section_for_page(outline, outline[2].start) == "Vol 1: Core › Part B: Baseband"
+    parsed = load_pdf(data, "toy.pdf", outline=outline)
+    assert any(p.section.endswith("Part A: L2CAP") for p in parsed.pages)
+
+
+SPEC = settings.DEFAULT_PDF_PATH
+
+
+@pytest.mark.skipif(not SPEC.is_file(), reason="Bluetooth spec PDF not present")
+def test_real_spec_le_physical_layer_slice():
+    """Vol 6 Part A of the Core 5.4 spec: headers stripped, LE power classes retrievable."""
+    parsed = load_pdf(read_pdf_bytes(SPEC), SPEC.name, page_start=2647, page_end=2664, outline=[])
+    assert not any("Bluetooth SIG Proprietary" in p.text for p in parsed.pages)
+    index = build_index(parsed, RAGConfig("t", RECURSIVE, 500, 50, 4, HASHING, settings.STORE_FAISS))
+    try:
+        result = answer_question(index, "What are the LE power classes and their maximum output power?", EXTRACTIVE, 0.0)
+        context = " ".join(c.document.page_content for c in result.chunks)
+        assert "Power Class" in context or "power class" in context.lower()
+    finally:
+        index.close()

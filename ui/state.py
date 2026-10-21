@@ -13,9 +13,9 @@ from pathlib import Path
 
 import streamlit as st
 
-from rag_lab import embeddings, settings
+from rag_lab import disk_cache, embeddings, settings
 from rag_lab.errors import PDFLoadError
-from rag_lab.pdf_loader import ParsedPDF, count_pages, load_pdf, read_pdf_bytes, sha256_bytes
+from rag_lab.pdf_loader import OutlineSection, ParsedPDF, count_pages, load_pdf, outline_of, read_pdf_bytes, sha256_bytes
 
 # Session-state keys (one place, to avoid typos)
 K_DOC_META = "doc_meta"
@@ -82,6 +82,30 @@ def source_key(sb) -> tuple:
     return (sha, sb.page_start, sb.page_end, sb.strip_boilerplate, sb.embedding, sb.vector_store)
 
 
+@st.cache_resource(max_entries=3, show_spinner=False)
+def page_text_cache(sha256: str) -> dict[int, str]:
+    """Process-wide ``{page: text}`` cache per document (shared by all sessions).
+
+    Extracting the 3,141-page Bluetooth spec takes about a minute; afterwards any page
+    range of it can be re-parsed in well under a second. Seeded from ``.cache/`` on disk.
+    """
+    return disk_cache.load_pages(sha256)
+
+
+@st.cache_data(max_entries=3, show_spinner="Reading the PDF's bookmarks…")
+def document_outline(sha256: str, _doc: DocumentSource) -> list[OutlineSection]:
+    """Bookmarks per document (slow in pypdf for big outlines, so cached by hash)."""
+    cached = disk_cache.load_outline(sha256)
+    if cached is not None:
+        return cached
+    try:
+        outline = outline_of(_doc.read_bytes())
+    except Exception:
+        return []  # bookmarks are a convenience; never block the app on them
+    disk_cache.save_outline(sha256, outline)
+    return outline
+
+
 def get_parsed(doc: DocumentSource, page_start: int, page_end: int, strip_boilerplate: bool) -> ParsedPDF:
     """Parse (or reuse) the selected page range. Only one parse is kept in memory."""
     key = (doc.sha256, page_start, page_end, strip_boilerplate)
@@ -90,6 +114,8 @@ def get_parsed(doc: DocumentSource, page_start: int, page_end: int, strip_boiler
         return cached[1]
 
     st.session_state.pop(K_PARSED, None)  # free the previous parse before making a new one
+    page_cache = page_text_cache(doc.sha256)
+    cached_before = len(page_cache)
     bar = st.progress(0.0, text=f"Parsing {doc.name}…")
     parsed = load_pdf(
         doc.read_bytes(),
@@ -98,8 +124,12 @@ def get_parsed(doc: DocumentSource, page_start: int, page_end: int, strip_boiler
         page_end,
         progress=lambda f, m: bar.progress(min(1.0, f), text=m),
         strip_boilerplate=strip_boilerplate,
+        page_cache=page_cache,
+        outline=document_outline(doc.sha256, doc),
     )
     bar.empty()
+    if len(page_cache) > cached_before:
+        disk_cache.save_pages(doc.sha256, page_cache)
     st.session_state[K_PARSED] = (key, parsed)
     return parsed
 

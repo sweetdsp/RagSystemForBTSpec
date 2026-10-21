@@ -19,7 +19,8 @@ from rag_lab.settings import ModelSpec
 from . import state
 from .components import show_error
 
-DEFAULT_PAGE_LIMIT = int(os.getenv("DEFAULT_PAGE_LIMIT", "400"))
+#: Optional cap on the default "last page" (0 = whole document).
+DEFAULT_PAGE_LIMIT = int(os.getenv("DEFAULT_PAGE_LIMIT", "0") or 0)
 
 
 def _human_size(n: int) -> str:
@@ -61,6 +62,12 @@ def _provider_model_picker(kind: str, catalog: dict[str, list[str]], default: Mo
     return ModelSpec(provider, model)
 
 
+def _apply_section(sec_key: str, p0_key: str, p1_key: str, total_pages: int) -> None:
+    """Section picker callback: copy the bookmark's page span into the range inputs."""
+    section = st.session_state.get(sec_key)
+    st.session_state[p0_key], st.session_state[p1_key] = (1, total_pages) if section is None else (section.start, section.end)
+
+
 def render_sidebar() -> SidebarState:
     sb = st.sidebar
     sb.title("⚙️ RAG Settings")
@@ -81,14 +88,34 @@ def render_sidebar() -> SidebarState:
         sb.caption(f"**{doc.name}** · {doc.total_pages:,} pages · {_human_size(doc.size_bytes)}  \n{origin}")
         if doc.origin == "sample":
             sb.info("Using the small bundled primer. Put the official spec at `data/bluetooth_core_spec.pdf` or upload it for the full experience.", icon="ℹ️")
+        p0_key, p1_key, sec_key = f"p0_{doc.sha256}", f"p1_{doc.sha256}", f"sec_{doc.sha256}"
+        default_end = min(doc.total_pages, DEFAULT_PAGE_LIMIT) if DEFAULT_PAGE_LIMIT > 0 else doc.total_pages
+        st.session_state.setdefault(p0_key, 1)
+        st.session_state.setdefault(p1_key, default_end)
+
+        outline = state.document_outline(doc.sha256, doc)
+        if outline:
+            sb.selectbox(
+                "Jump to section",
+                [None, *outline],
+                format_func=lambda s: f"Whole document (pp. 1–{doc.total_pages})" if s is None else s.label,
+                key=sec_key,
+                on_change=_apply_section,
+                args=(sec_key, p0_key, p1_key, doc.total_pages),
+                help="From the PDF's bookmarks. Sets the page range below; you can still fine-tune it.",
+            )
         c1, c2 = sb.columns(2)
-        page_start = c1.number_input("First page", 1, doc.total_pages, 1, key=f"p0_{doc.sha256}")
-        page_end = c2.number_input("Last page", 1, doc.total_pages, min(doc.total_pages, DEFAULT_PAGE_LIMIT), key=f"p1_{doc.sha256}")
+        page_start = c1.number_input("First page", 1, doc.total_pages, key=p0_key)
+        page_end = c2.number_input("Last page", 1, doc.total_pages, key=p1_key)
         if page_end < page_start:
             sb.warning("Last page is before first page; using the first page only.")
             page_end = page_start
-        if doc.total_pages > DEFAULT_PAGE_LIMIT:
-            sb.caption(f"Large document: only pages {page_start}–{page_end} are indexed. Wider ranges take longer and use more RAM (and cost more with OpenAI embeddings).")
+        n_pages = page_end - page_start + 1
+        if n_pages > 300:
+            sb.caption(
+                f"Indexing {n_pages:,} pages. The first parse of a large PDF takes ~20 ms/page (cached afterwards); "
+                "embedding time and OpenAI cost grow with the page count and shrink with chunk size."
+            )
         strip = sb.checkbox("Remove repeated headers/footers", value=True, help="Drops lines that repeat at the top/bottom of most pages (e.g. 'Bluetooth SIG Proprietary | Vol 6, Part B page 2860').")
 
     # ---------------------------------------------------------------- Models

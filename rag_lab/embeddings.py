@@ -27,6 +27,7 @@ from langchain_core.embeddings import Embeddings
 from . import settings
 from .errors import MissingAPIKeyError, MissingDependencyError, RAGLabError
 from .settings import ModelSpec
+from .text_utils import STOPWORDS
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
@@ -39,7 +40,13 @@ class HashingEmbeddings(Embeddings):
 
     def _embed(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
-        words = _TOKEN_RE.findall(text.lower())
+        # Stopwords would make every English sentence look alike, so they are skipped.
+        words = [w for w in _TOKEN_RE.findall(text.lower()) if w not in STOPWORDS]
+        if not words:
+            # A zero vector would break cosine scoring (FAISS would rank it at cos 0.5
+            # against *every* query), so text without words gets its own fixed direction.
+            vec[0] = 1.0
+            return vec
         features = words + [f"{a} {b}" for a, b in zip(words, words[1:])]
         for feat in features:
             h = zlib.crc32(feat.encode())

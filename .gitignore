@@ -222,3 +222,4 @@ __marimo__/
 # RAG Lab: the official spec is copyrighted and large; keep it out of git
 data/*.pdf
 !data/sample_bluetooth_primer.pdf
+!data/bluetooth_core_spec.pdf

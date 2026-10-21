@@ -28,7 +28,8 @@ SYSTEM_PROMPT = (
     "Answer the user's question using ONLY the numbered context passages provided. "
     "Cite the passages you rely on with bracketed numbers like [1] or [2][3]. "
     "If the context does not contain enough information, say so explicitly rather than guessing. "
-    "Be precise with numbers, units, field names and section references."
+    "Be precise with numbers, units, field names and section references; when useful, name the "
+    "Volume/Part shown in a passage's header."
 )
 
 
@@ -49,7 +50,8 @@ def format_context(chunks: list[ScoredChunk]) -> str:
     for i, c in enumerate(chunks, start=1):
         m = c.document.metadata
         pages = f"p.{m.get('page_start')}" if m.get("page_start") == m.get("page_end") else f"pp.{m.get('page_start')}-{m.get('page_end')}"
-        blocks.append(f"[{i}] ({pages})\n{c.document.page_content}")
+        source = f"{m['section']}, {pages}" if m.get("section") else pages
+        blocks.append(f"[{i}] ({source})\n{c.document.page_content}")
     return "\n\n---\n\n".join(blocks)
 
 

@@ -17,6 +17,7 @@ from ui.sidebar import render_memory_section, render_sidebar
 from ui.single_tab import render_single_tab
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("pypdf").setLevel(logging.ERROR)  # the BT spec triggers harmless decryption-padding warnings
 
 st.set_page_config(page_title="RAG Lab · Bluetooth Spec", page_icon="📡", layout="wide")
 st.markdown(components.CSS, unsafe_allow_html=True)

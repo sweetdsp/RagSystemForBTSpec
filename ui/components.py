@@ -29,6 +29,13 @@ def page_label(meta: dict) -> str:
     return f"p. {a}" if a == b else f"pp. {a}–{b}"
 
 
+def short_section(section: str) -> str:
+    """'Vol 6: Low Energy Controller › Part A: Physical…' → 'Vol 6 › Part A · ' (compact titles)."""
+    if not section:
+        return ""
+    return " › ".join(part.split(":")[0].strip() for part in section.split("›")) + " · "
+
+
 def build_metrics(index: RAGIndex) -> None:
     """The four headline numbers requested after an index build, plus details."""
     s = index.stats
@@ -68,7 +75,7 @@ def chunk_previews(index: RAGIndex, key: str) -> None:
     i = st.slider("Sample chunk", 1, len(samples), 1, key=f"{key}_chunk_slider", help=f"{len(samples)} chunks sampled evenly across the document")
     doc = samples[i - 1]
     m = doc.metadata
-    st.markdown(f"**Chunk #{m['chunk_id']}** · {page_label(m)} · **{m['char_len']:,} chars** · {m['token_len']:,} tokens · offset {m['start_index']:,}")
+    st.markdown(f"**Chunk #{m['chunk_id']}** · {short_section(m.get('section', ''))}{page_label(m)} · **{m['char_len']:,} chars** · {m['token_len']:,} tokens · offset {m['start_index']:,}")
     st.code(doc.page_content, language=None, wrap_lines=True)
     with st.popover("Raw metadata"):
         st.json(m)
@@ -78,9 +85,12 @@ def retrieved_chunks(chunks: list[ScoredChunk], distance_label: str = "", expand
     """Collapsible list of retrieved chunks with similarity, distance and source."""
     for rank, c in enumerate(chunks, start=1):
         m = c.document.metadata
-        title = f"[{rank}] cos sim {c.similarity:.3f} · dist {c.distance:.3f} · {page_label(m)} · {len(c.document.page_content):,} chars"
+        title = f"[{rank}] cos sim {c.similarity:.3f} · dist {c.distance:.3f} · {short_section(m.get('section', ''))}{page_label(m)} · {len(c.document.page_content):,} chars"
         with st.expander(title, expanded=expanded_first and rank == 1):
-            st.caption(f"Chunk #{m.get('chunk_id')} · distance metric: {distance_label or 'see vector store'}")
+            st.caption(
+                f"Chunk #{m.get('chunk_id')} · distance metric: {distance_label or 'see vector store'}"
+                + (f"  \n📑 {m['section']}" if m.get("section") else "")
+            )
             st.markdown(f"<div class='chunk-box'>{_escape(c.document.page_content)}</div>", unsafe_allow_html=True)
 
 

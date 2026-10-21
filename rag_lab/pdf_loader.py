@@ -1,8 +1,12 @@
 """PDF parsing with pypdf.
 
-The Bluetooth Core Specification is ~3,500 pages, so this module:
+The Bluetooth Core Specification is ~3,100 pages, so this module:
 
-* lets the caller restrict parsing to a page range (huge memory/time saver),
+* lets the caller restrict parsing to a page range (huge memory/time saver) and
+  reuse already-extracted pages through a ``page_cache``,
+* reads the PDF bookmarks (outline) so every page knows its section, e.g.
+  "Vol 6: Low Energy Controller › Part A: Physical Layer Specification",
+* removes running headers/footers and control characters,
 * skips individual pages that fail to extract instead of aborting the whole run,
 * raises :class:`PDFLoadError` with actionable hints for corrupt, encrypted or
   scanned (image-only) documents.
@@ -26,13 +30,31 @@ from .errors import PDFLoadError
 
 ProgressFn = Callable[[float, str], None]
 
+#: Bump when text extraction/cleaning changes, so on-disk page caches are rebuilt.
+PARSER_VERSION = 2
+
 _MULTISPACE = re.compile(r"[ \t ]+")
 _MANY_NEWLINES = re.compile(r"\n{3,}")
 _HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
 _DIGITS = re.compile(r"\d+")
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # e.g. figure labels in symbol fonts
 
-#: How many lines at the top/bottom of each page are inspected for running headers/footers.
-EDGE_LINES = 3
+#: Lines at the top/bottom of each page inspected for running headers/footers.
+#: (The Bluetooth spec stacks four header lines: section title + version date,
+#: "Bluetooth SIG Proprietary", "... | Vol 6, Part B page 2799" and the Part title.)
+TOP_LINES = 4
+BOTTOM_LINES = 3
+
+#: A top line is a running header if it repeats on >= LOCAL_HITS of the
+#: 2*LOCAL_WINDOW+1 surrounding pages (headers change per chapter, so a single
+#: document-wide frequency threshold misses most of them).
+LOCAL_WINDOW = 5
+LOCAL_HITS = 6
+
+#: Outline entries covering more than this share of the document are wrappers
+#: ("Core Specification v5.4") and are left out of section labels.
+WRAPPER_SHARE = 0.8
+SECTION_SEPARATOR = " › "
 
 
 @dataclass
@@ -41,6 +63,21 @@ class PageText:
 
     page_number: int
     text: str
+    section: str = ""  # bookmark breadcrumb, "" when the PDF has no outline
+
+
+@dataclass(frozen=True)
+class OutlineSection:
+    """A bookmark with its inclusive page span (1-based)."""
+
+    title: str
+    depth: int  # 0 = top level of the kept outline
+    start: int
+    end: int
+
+    @property
+    def label(self) -> str:
+        return f"{'↳ ' * self.depth}{self.title} (pp. {self.start}–{self.end})"
 
 
 @dataclass
@@ -55,6 +92,7 @@ class ParsedPDF:
     pages: list[PageText] = field(default_factory=list)
     skipped_pages: list[int] = field(default_factory=list)
     removed_boilerplate: list[str] = field(default_factory=list)
+    outline: list[OutlineSection] = field(default_factory=list)
     parse_seconds: float = 0.0
 
     @property
@@ -72,9 +110,21 @@ class ParsedPDF:
         return f"{self.sha256[:12]}:{self.page_range[0]}-{self.page_range[1]}:{clean}"
 
 
+def _is_glyph_garbage(line: str) -> bool:
+    """True for lines extracted from figures drawn with symbol fonts.
+
+    Such text comes out as runs of unrelated accented/Greek letters (e.g.
+    "/^ͺ^ǇŶĐͺĞůĂǇĨŽƌ"): meaningless to an embedding model and pure noise in a chunk.
+    """
+    letters = [ch for ch in line if ch.isalpha()]
+    exotic = sum(1 for ch in letters if ord(ch) > 0x24F or 0x100 <= ord(ch) <= 0x24F)
+    return exotic >= 4 and exotic >= 0.4 * len(letters)
+
+
 def clean_text(text: str) -> str:
     """Light normalisation that keeps paragraph structure for the splitters."""
-    text = text.replace("\x00", "")
+    text = _CONTROL_CHARS.sub("", text)
+    text = "\n".join(line for line in text.splitlines() if not _is_glyph_garbage(line))
     text = _HYPHEN_BREAK.sub(r"\1\2", text)  # re-join words hyphenated across lines
     text = _MULTISPACE.sub(" ", text)
     text = "\n".join(line.strip() for line in text.splitlines())
@@ -87,30 +137,124 @@ def _edge_key(line: str) -> str:
     return _DIGITS.sub("#", line.strip().lower())
 
 
-def strip_running_headers(pages: list[PageText], min_share: float = 0.5) -> list[str]:
-    """Remove header/footer lines repeated on most pages (in place).
+def _edge_keys(text: str) -> tuple[list[str], list[str]]:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return [_edge_key(ln) for ln in lines[:TOP_LINES]], [_edge_key(ln) for ln in lines[-BOTTOM_LINES:]]
 
-    Specs repeat banners such as "BLUETOOTH CORE SPECIFICATION Version 5.4 | Vol 6,
+
+def _tail(key: str, n_words: int = 3) -> str:
+    words = key.split()
+    return " ".join(words[-n_words:]) if len(words) > n_words else ""
+
+
+def strip_running_headers(pages: list[PageText], min_share: float = 0.5) -> list[str]:
+    """Remove running header/footer lines (in place).
+
+    Specs print banners such as "BLUETOOTH CORE SPECIFICATION Version 5.4 | Vol 6,
     Part B page 2860" on every page. Left in, they end up in nearly every chunk,
-    make unrelated chunks look similar to each other and waste context tokens.
-    Returns the normalised patterns that were removed (shown in the UI).
+    make unrelated chunks look alike and waste context tokens. A line (with
+    digits ignored) is removed when it sits at the top/bottom edge of
+
+    * at least ``min_share`` of all pages (document-wide banners/footers), or,
+      for top lines only, of most neighbouring pages (chapter-specific headers),
+      or ends with the same three words as the top lines of most pages.
+
+    Returns the removed patterns, most frequent first (shown in the UI).
     """
     if len(pages) < 3:
         return []
-    counts: Counter[str] = Counter()
-    for page in pages:
-        lines = [ln for ln in page.text.splitlines() if ln.strip()]
-        counts.update({_edge_key(ln) for ln in lines[:EDGE_LINES] + lines[-EDGE_LINES:]})
+    keys = [_edge_keys(p.text) for p in pages]
     threshold = max(3, int(len(pages) * min_share))
-    boilerplate = {key for key, n in counts.items() if n >= threshold and key}
-    if not boilerplate:
-        return []
-    for page in pages:
+    counts = Counter(k for top, bottom in keys for k in set(top + bottom) if k)
+    global_bp = {k for k, n in counts.items() if n >= threshold}
+    # Headers that merge a varying title with a fixed tail ("<section> Version Date: #-#-#"):
+    # a tail shared by the top lines of most pages marks those lines as headers too.
+    tails = Counter(t for top, _ in keys for t in {_tail(k) for k in top} if t)
+    header_tails = {t for t, n in tails.items() if n >= threshold}
+
+    removed: Counter[str] = Counter()
+    for i, page in enumerate(pages):
+        lo, hi = max(0, i - LOCAL_WINDOW), min(len(pages), i + LOCAL_WINDOW + 1)
+        local = Counter(k for top, _ in keys[lo:hi] for k in set(top))
+        top_bp = global_bp | {k for k in keys[i][0] if k and (local[k] >= LOCAL_HITS or _tail(k) in header_tails)}
+
         lines = page.text.splitlines()
-        nonblank = [i for i, ln in enumerate(lines) if ln.strip()]
-        edges = set(nonblank[:EDGE_LINES] + nonblank[-EDGE_LINES:])
-        page.text = "\n".join(ln for i, ln in enumerate(lines) if not (i in edges and _edge_key(ln) in boilerplate)).strip()
-    return sorted(boilerplate)
+        nonblank = [j for j, ln in enumerate(lines) if ln.strip()]
+        top_idx, bottom_idx = set(nonblank[:TOP_LINES]), set(nonblank[-BOTTOM_LINES:])
+        kept = []
+        for j, ln in enumerate(lines):
+            key = _edge_key(ln)
+            if (j in top_idx and key in top_bp) or (j in bottom_idx and key in global_bp):
+                removed[key] += 1
+            else:
+                kept.append(ln)
+        page.text = "\n".join(kept).strip()
+    return [k for k, _ in removed.most_common()]
+
+
+def read_outline(reader: PdfReader, max_depth: int = 5, max_level: int = 1) -> list[OutlineSection]:
+    """Flatten the PDF bookmarks into sections with page spans.
+
+    Wrapper entries spanning almost the whole file are dropped and the first
+    ``max_level + 1`` remaining levels are kept (for the Bluetooth spec: Vol and
+    Part, ~60 entries). Returns ``[]`` for PDFs without bookmarks.
+
+    Note: pypdf materialises the whole outline first, which takes ~10 s for the
+    Bluetooth spec, so callers should cache the result per document.
+    """
+    n_pages = len(reader.pages)
+    raw: list[tuple[int, str, int]] = []
+
+    def walk(items, depth: int) -> None:
+        for item in items:
+            if isinstance(item, list):
+                if depth < max_depth:
+                    walk(item, depth + 1)
+                continue
+            try:
+                raw.append((depth, str(item.title).strip(), reader.get_destination_page_number(item) + 1))
+            except Exception:
+                continue  # dangling bookmark
+
+    try:
+        walk(reader.outline, 0)
+    except Exception:
+        return []
+    if not raw:
+        return []
+
+    # Each entry ends where the next entry at the same or a shallower depth begins.
+    spans = []
+    for i, (depth, title, start) in enumerate(raw):
+        end = n_pages
+        for depth2, _, start2 in raw[i + 1 :]:
+            if depth2 <= depth:
+                end = max(start, start2 - 1)
+                break
+        spans.append((depth, title, start, end))
+
+    # Depth counted in non-wrapper ancestors, so "Core Specification v5.4 › Vol 6 › Part A"
+    # becomes Vol (0) › Part (1).
+    sections: list[OutlineSection] = []
+    stack: list[tuple[int, bool]] = []  # (raw depth, is_wrapper) of the current ancestors
+    for depth, title, start, end in spans:
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        wrapper = (end - start + 1) > WRAPPER_SHARE * n_pages
+        level = sum(1 for _, w in stack if not w)
+        stack.append((depth, wrapper))
+        if not wrapper and level <= max_level:
+            sections.append(OutlineSection(title, level, start, end))
+    return sections
+
+
+def section_for_page(outline: list[OutlineSection], page_number: int, max_depth: int = 1) -> str:
+    """Breadcrumb of the outline entries containing ``page_number`` (e.g. Vol › Part)."""
+    crumbs: dict[int, str] = {}
+    for sec in outline:
+        if sec.depth <= max_depth and sec.start <= page_number <= sec.end:
+            crumbs[sec.depth] = sec.title
+    return SECTION_SEPARATOR.join(crumbs[d] for d in sorted(crumbs))
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -131,6 +275,11 @@ def read_pdf_bytes(path: str | Path) -> bytes:
 def count_pages(data: bytes) -> int:
     """Cheap page count (no text extraction) used to size the page-range inputs."""
     return len(_open_reader(data).pages)
+
+
+def outline_of(data: bytes) -> list[OutlineSection]:
+    """Bookmarks of a PDF given as bytes (cache the result; see :func:`read_outline`)."""
+    return read_outline(_open_reader(data))
 
 
 def _open_reader(data: bytes) -> PdfReader:
@@ -173,6 +322,8 @@ def load_pdf(
     page_end: int | None = None,
     progress: ProgressFn | None = None,
     strip_boilerplate: bool = True,
+    page_cache: dict[int, str] | None = None,
+    outline: list[OutlineSection] | None = None,
 ) -> ParsedPDF:
     """Extract and clean text from ``data``.
 
@@ -181,7 +332,12 @@ def load_pdf(
         name: Display name (file name).
         page_start / page_end: Optional inclusive 1-based page range.
         progress: Optional ``callback(fraction, message)`` for UI progress bars.
-        strip_boilerplate: Remove running headers/footers repeated on most pages.
+        strip_boilerplate: Remove running headers/footers.
+        page_cache: Optional ``{page_number: cleaned text}`` dict for this document.
+            Pages found in it are not re-extracted; newly extracted pages are added.
+            Extraction is the slow part (~20 ms/page), so a cache makes changing the
+            page range or rebuilding nearly instant.
+        outline: Pre-computed :func:`outline_of` result; read from the PDF if None.
     """
     t0 = time.perf_counter()
     reader = _open_reader(data)
@@ -200,18 +356,24 @@ def load_pdf(
         file_size_bytes=len(data),
         total_pages_in_file=n_pages,
         page_range=(start, end),
+        outline=read_outline(reader) if outline is None else outline,
     )
 
     span = end - start + 1
     for i, page_no in enumerate(range(start, end + 1)):
-        try:
-            raw = reader.pages[page_no - 1].extract_text() or ""
-        except Exception:  # a single malformed page must not kill a 3,000-page parse
-            parsed.skipped_pages.append(page_no)
-            continue
-        text = clean_text(raw)
+        if page_cache is not None and page_no in page_cache:
+            text = page_cache[page_no]
+        else:
+            try:
+                text = clean_text(reader.pages[page_no - 1].extract_text() or "")
+            except Exception:  # a single malformed page must not kill a 3,000-page parse
+                parsed.skipped_pages.append(page_no)
+                continue
+            if page_cache is not None:
+                page_cache[page_no] = text
         if text:
-            parsed.pages.append(PageText(page_number=page_no, text=text))
+            section = section_for_page(parsed.outline, page_no)
+            parsed.pages.append(PageText(page_number=page_no, text=text, section=section))
         if progress and (i % 25 == 0 or i == span - 1):
             progress((i + 1) / span, f"Parsing page {page_no}/{end}")
 

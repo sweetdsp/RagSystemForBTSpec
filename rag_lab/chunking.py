@@ -45,6 +45,8 @@ STRATEGY_HELP = {
 }
 
 TIKTOKEN_ENCODING = "cl100k_base"
+#: Fragments shorter than this (stray table cells, figure labels) are dropped as noise.
+MIN_CHUNK_CHARS = 20
 PAGE_JOINER = "\n\n"
 
 
@@ -116,20 +118,27 @@ class _JoinedText:
     text: str
     page_starts: list[int]  # char offset where each page begins
     page_numbers: list[int]
+    sections: list[str]
+
+    def _index(self, offset: int) -> int:
+        return max(0, bisect.bisect_right(self.page_starts, max(0, offset)) - 1)
 
     def page_at(self, offset: int) -> int:
-        idx = bisect.bisect_right(self.page_starts, max(0, offset)) - 1
-        return self.page_numbers[max(0, idx)]
+        return self.page_numbers[self._index(offset)]
+
+    def section_at(self, offset: int) -> str:
+        return self.sections[self._index(offset)]
 
 
 def _join_pages(parsed: ParsedPDF) -> _JoinedText:
-    parts, starts, numbers, cursor = [], [], [], 0
+    parts, starts, numbers, sections, cursor = [], [], [], [], 0
     for page in parsed.pages:
         starts.append(cursor)
         numbers.append(page.page_number)
+        sections.append(page.section)
         parts.append(page.text)
         cursor += len(page.text) + len(PAGE_JOINER)
-    return _JoinedText(PAGE_JOINER.join(parts), starts, numbers)
+    return _JoinedText(PAGE_JOINER.join(parts), starts, numbers, sections)
 
 
 def split_document(
@@ -142,7 +151,7 @@ def split_document(
     """Split a parsed PDF into LangChain ``Document`` chunks with rich metadata.
 
     Metadata per chunk: ``chunk_id``, ``source``, ``page_start``, ``page_end``,
-    ``start_index`` (char offset in the joined text), ``char_len`` and
+    ``section`` (PDF bookmark breadcrumb, may be empty), ``start_index`` (char offset in the joined text), ``char_len`` and
     ``token_len``.
     """
     splitter = make_splitter(strategy, chunk_size, chunk_overlap)
@@ -162,7 +171,7 @@ def split_document(
     last_start = 0
     for i, doc in enumerate(raw_chunks):
         text = doc.page_content.strip()
-        if not text:
+        if len(text) < MIN_CHUNK_CHARS:
             continue
         start = doc.metadata.get("start_index", -1)
         if start is None or start < 0:  # token decoding can defeat exact substring search
@@ -176,6 +185,7 @@ def split_document(
                     "source": parsed.name,
                     "page_start": joined.page_at(start),
                     "page_end": joined.page_at(start + len(text) - 1),
+                    "section": joined.section_at(start),
                     "start_index": start,
                     "char_len": len(text),
                     "token_len": count_tokens(text),
