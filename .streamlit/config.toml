@@ -1,0 +1,10 @@
+[server]
+# Upload limit in MB; the full Bluetooth Core Specification PDF is ~50-100 MB.
+maxUploadSize = 300
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#2a78d6"
